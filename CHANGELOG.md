@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- [playback] Stop instead of skipping the queue when Spotify refuses a track's audio key
 - [playback] Prevent clicks caused by decoded PCM discontinuities when manually switching tracks in gapless mode
 - [audio] Fixed integer overflow in throughput calculation
 - [main] Fixed `--volume-ctrl fixed` not disabling volume control
