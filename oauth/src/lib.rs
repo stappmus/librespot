@@ -166,17 +166,32 @@ fn get_authcode_stdin() -> Result<AuthorizationCode, OAuthError> {
     get_code(buffer.trim())
 }
 
-/// Spawn HTTP server at provided socket address to accept OAuth callback and return auth code.
+// Keep the bound socket alive across opening the browser. A probe followed by
+// rebinding would allow another process to take the callback port in between.
+fn get_authcode(
+    redirect_uri: &str,
+    message: String,
+    authorize: impl FnOnce() -> PkceCodeVerifier,
+) -> Result<(AuthorizationCode, PkceCodeVerifier), OAuthError> {
+    let listener = get_socket_address(redirect_uri)
+        .map(|addr| {
+            TcpListener::bind(addr).map_err(|e| OAuthError::AuthCodeListenerBind { addr, e })
+        })
+        .transpose()?;
+    let verifier = authorize();
+    let code = match listener {
+        Some(listener) => get_authcode_listener(listener, message),
+        None => get_authcode_stdin(),
+    }?;
+    Ok((code, verifier))
+}
+
+/// Accept an OAuth callback on an already-bound HTTP listener.
 fn get_authcode_listener(
-    socket_address: SocketAddr,
+    listener: TcpListener,
     message: String,
 ) -> Result<AuthorizationCode, OAuthError> {
-    let listener =
-        TcpListener::bind(socket_address).map_err(|e| OAuthError::AuthCodeListenerBind {
-            addr: socket_address,
-            e,
-        })?;
-    info!("OAuth server listening on {socket_address:?}");
+    info!("OAuth server listening on {:?}", listener.local_addr());
 
     // The server will terminate itself after collecting the first code.
     let mut stream = listener
@@ -283,12 +298,9 @@ impl OAuthClient {
 
     /// Syncronously obtain a Spotify access token using the authorization code with PKCE OAuth flow.
     pub fn get_access_token(&self) -> Result<OAuthToken, OAuthError> {
-        let pkce_verifier = self.set_auth_url();
-
-        let code = match get_socket_address(&self.redirect_uri) {
-            Some(addr) => get_authcode_listener(addr, self.message.clone()),
-            _ => get_authcode_stdin(),
-        }?;
+        let (code, pkce_verifier) = get_authcode(&self.redirect_uri, self.message.clone(), || {
+            self.set_auth_url()
+        })?;
         trace!("Exchange {code:?} for access token");
 
         let (tx, rx) = mpsc::channel();
@@ -325,12 +337,9 @@ impl OAuthClient {
 
     /// Asyncronously obtain a Spotify access token using the authorization code with PKCE OAuth flow.
     pub async fn get_access_token_async(&self) -> Result<OAuthToken, OAuthError> {
-        let pkce_verifier = self.set_auth_url();
-
-        let code = match get_socket_address(&self.redirect_uri) {
-            Some(addr) => get_authcode_listener(addr, self.message.clone()),
-            _ => get_authcode_stdin(),
-        }?;
+        let (code, pkce_verifier) = get_authcode(&self.redirect_uri, self.message.clone(), || {
+            self.set_auth_url()
+        })?;
         trace!("Exchange {code:?} for access token");
 
         let http_client = reqwest::Client::new();
@@ -467,12 +476,14 @@ pub fn get_access_token(
         .set_pkce_challenge(pkce_challenge)
         .url();
 
-    println!("Browse to: {auth_url}");
-
-    let code = match get_socket_address(redirect_uri) {
-        Some(addr) => get_authcode_listener(addr, String::from("Go back to your terminal :)")),
-        _ => get_authcode_stdin(),
-    }?;
+    let (code, pkce_verifier) = get_authcode(
+        redirect_uri,
+        String::from("Go back to your terminal :)"),
+        || {
+            println!("Browse to: {auth_url}");
+            pkce_verifier
+        },
+    )?;
     trace!("Exchange {code:?} for access token");
 
     // Do this sync in another thread because I am too stupid to make the async version work.
@@ -557,5 +568,60 @@ mod test {
             get_socket_address("http://[2001:4860:4860::8888]:8888/foo"),
             Some(addr_v6)
         );
+    }
+}
+
+#[cfg(test)]
+mod listener_tests {
+    use super::*;
+    use std::{
+        cell::{Cell, RefCell},
+        net::TcpStream,
+    };
+
+    #[test]
+    fn occupied_port_fails_without_publishing_authorization_url() {
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = occupied.local_addr().unwrap();
+        let authorized = Cell::new(false);
+        let result = get_authcode(&format!("http://{addr}/login"), String::new(), || {
+            authorized.set(true);
+            PkceCodeChallenge::new_random_sha256().1
+        });
+        assert!(
+            matches!(result, Err(OAuthError::AuthCodeListenerBind { e, .. })
+            if e.kind() == io::ErrorKind::AddrInUse)
+        );
+        assert!(!authorized.get());
+    }
+
+    #[test]
+    fn callback_socket_is_owned_before_authorization_and_used_without_rebinding() {
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let callback = RefCell::new(None);
+        let result = get_authcode(&format!("http://{addr}/login"), "Done".into(), || {
+            assert_eq!(
+                TcpListener::bind(addr).unwrap_err().kind(),
+                io::ErrorKind::AddrInUse
+            );
+            // Connect immediately, before get_authcode starts accepting. Keeping
+            // the same listener ensures this queued callback is not discarded.
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream
+                .write_all(b"GET /login?code=test-code HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap();
+            *callback.borrow_mut() = Some(std::thread::spawn(move || {
+                let mut response = String::new();
+                BufReader::new(stream).read_line(&mut response).unwrap();
+                assert!(response.starts_with("HTTP/1.1 200"));
+            }));
+            PkceCodeVerifier::new("test-verifier".into())
+        })
+        .unwrap();
+        assert_eq!(result.0.secret(), "test-code");
+        assert_eq!(result.1.secret(), "test-verifier");
+        callback.into_inner().unwrap().join().unwrap();
     }
 }
